@@ -2,6 +2,27 @@
 
 *Internal copy supporting 4D ..*
 
+## how to install this:
+
+```
+git clone git@github.com:cbc-univie/asfe-4D.git
+git clone git@github.com:cbc-univie/openmm-ml.git
+cd openmm-ml/
+pip install .
+mamba install -c conda-forge pytorch 
+mamba install -c conda-forge openmm 
+mamba install -c conda-forge openmm-torch
+cd ..
+git clone git@github.com:cbc-univie/mace.git
+cd mace
+pip install .
+mamba install -c conda-forge nnpops
+```
+und einen sample Job per Hand aufrufen:
+```
+python sample_states.py --lamb "0.0" --pdb ../data/ethane_waterbox/input/ethane_waterbox.pdb
+```
+
 This is a high level API for using machine learning models in OpenMM simulations.  With just a few lines of code, you
 can set up a simulation that uses a standard, pretrained model to represent some or all of the interactions in a system.
 
