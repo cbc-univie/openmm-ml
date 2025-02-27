@@ -41,11 +41,15 @@ def wrap_model():
     from mace.calculators import mace_off
     from mace.tools.scripts_utils import extract_config_mace_model
     from mace import modules
-
-    model = mace_off(model="medium", device="cpu", default_dtype="float32").models[0]
+    size :str = 'medium'
+    default_dtype: str="float32"
+    print(f'Using model size : {size} with precision: {default_dtype}')
+    model = mace_off(model=size, device="cpu", default_dtype=default_dtype).models[0] #FIXME: why indexing?
+    # extract hyperparameters of model and build the model according to hyperparameter and size
     model_copy = modules.models.AlchemicalScaleShiftMACE(
         **extract_config_mace_model(model)
     )
+    # load trained parameters & biases from openff MACE model
     model_copy.load_state_dict(model.state_dict())
     return model_copy
 
@@ -188,6 +192,8 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         # Load the model to the CPU (OpenMM-Torch takes care of loading to the right devices)
         if self.name.startswith("mace-off23"):
+            # NOTE: DON'T USE THIS
+            # THAT"S THE ORIGINAL MACE CALL
             size = self.name.split("-")[-1]
             assert size in [
                 "small",
@@ -199,9 +205,11 @@ class MACEPotentialImpl(MLPotentialImpl):
             if self.modelPath is not None:
                 model = torch.load(self.modelPath, map_location="cpu")
             else:
+                raise RuntimeError('fail :-)')
+        elif self.name == 'mace-alch':
                 # this is what should be called to run alchemical MACE
+                print('Using alchemical MACE ...')
                 model = wrap_model()
-                # raise ValueError("No modelPath provided for local MACE model.")
         else:
             raise ValueError(f"Unsupported MACE model: {self.name}")
 
@@ -233,7 +241,7 @@ class MACEPotentialImpl(MLPotentialImpl):
                 f"and requested dtype is {dtype}. "
                 "The model will be converted to the requested dtype."
             )
-
+    
         # One hot encoding of atomic numbers
         zTable = utils.AtomicNumberTable([int(z) for z in model.atomic_numbers])
         nodeAttrs = to_one_hot(
@@ -358,7 +366,7 @@ class MACEPotentialImpl(MLPotentialImpl):
                 edgeIndex : torch.Tensor
                     The edge indices.
                 shifts : torch.Tensor
-                    The shifts.
+                    The shifts for the PBC.
                 """
                 # Get the neighbor pairs, shifts and edge indices.
                 neighbors, wrappedDeltas, _, _ = getNeighborPairs(
@@ -380,7 +388,6 @@ class MACEPotentialImpl(MLPotentialImpl):
                         dtype=self.dtype,
                         device=positions.device,
                     )
-
                 return edgeIndex, shifts
 
             def get_edge_modify_mask(
@@ -413,7 +420,7 @@ class MACEPotentialImpl(MLPotentialImpl):
 
             from typing import Tuple
 
-            def get_edge_vectors_and_lengths_mod(
+            def get_edge_vectors_and_lengths_mod( # NOTE: that one includes the alchemical magic
                 self,
                 positions: torch.Tensor,  # [n_nodes, 3]
                 edge_index: torch.Tensor,  # [2, n_edges] -> [2, n_pairs], cutoff is considered
@@ -427,20 +434,20 @@ class MACEPotentialImpl(MLPotentialImpl):
                 torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
             ]:
                 
-                sender = edge_index[0] # equivalent to atom_i, atom_i[2]
-                receiver = edge_index[1] # equivalent to atom_j, atom_j[2]
+                sender = edge_index[0] # equivalent to atom_i
+                receiver = edge_index[1] # equivalent to atom_j
 
                 # Use slices instead of materializing intermediate tensors
                 vectors = positions.index_select(0, receiver) - positions.index_select(
                     0, sender
-                )
-                vectors = vectors + shifts  # [n_edges, 3]
+                ) # could be as positions[sender] - positions[receiver]
+                vectors = vectors + shifts  # [n_edges, 3] # vectors under PBC (minimum image convention)
 
                 distance = torch.linalg.norm(
                     vectors, dim=-1, keepdim=True
                 )  # [n_edges, 1]
 
-                if normalize:
+                if normalize: # NOTE: test if this has an effect when set to True
                     vectors = vectors / (distance + eps)
 
                 #  Apply modification only to edges where edge_modify_mask is 1
@@ -449,30 +456,28 @@ class MACEPotentialImpl(MLPotentialImpl):
                     modify_mask = (
                         edge_modify_mask != 0
                     )  # [n_edges] - boolean-like tensor
-                    delta = lambda_value * cutoff  # Increment over the cutoff
-                    # print(f"Delta: {delta}")
-                    # print(f"Lengths: {lengths}")
-                    # print(f"Modify mask: {modify_mask}")
+                    # FIXME: make sure that 0 and 1 have the right values?
+                    delta = lambda_value * cutoff  # Increment over the cutoff # FIXME:
+                    
                     distance = distance.clone()
                     distance[modify_mask] = distance[modify_mask] + delta
                     # print(f"Lengths after: {lengths}")
 
-                    # lengths[modify_mask] = lengths[modify_mask] + delta
 
                 # # Apply cutoff to mask out long edges
                 valid_mask = distance.squeeze(-1) <= cutoff  # [n_edges]
                 # Use the mask to filter `index` and `target`
-                filtered_lengths = distance[valid_mask]
+                filtered_lengths = distance[valid_mask] 
                 filtered_vectors = vectors[valid_mask]
                 filtered_edge_index = edge_index[:, valid_mask]
                 filtered_shifts = shifts[valid_mask]
 
                 return (
-                    filtered_vectors,
-                    distance.detach(),
-                    filtered_lengths,
-                    filtered_edge_index,
-                    filtered_shifts,
+                    filtered_vectors, # [n_edge, 3] # NOTE: n_edges might have changed
+                    distance.detach(), # [n_edges, ] # NOTE: without filters 
+                    filtered_lengths, # [n_edges, ] # NOTEL filtered
+                    filtered_edge_index, #[2, n_edges]
+                    filtered_shifts, # [n_edges, 3]
                 )
 
             def forward(
@@ -508,22 +513,26 @@ class MACEPotentialImpl(MLPotentialImpl):
 
                 # Get the shifts and edge indices.
                 edge_index, shifts = self._getNeighborPairs(positions, cell)
+                # NOTE: call modified function for alchemistry
+                # returns the alchemical modification vector (if 0 edge will be modified in lambda protocol, if 1 edge will not be modified)
                 edge_modify_mask = self.get_edge_modify_mask(
                     edge_index,  # [2, n_edges]
-                    self.atom_groups,
-                )  # [n_edges
+                    self.atom_groups, # [n_atoms]
+                )  # [n_edges, ]
+
+                # cast to GPU if necessary
                 edge_modify_mask = edge_modify_mask.to(positions.device)
 
                 # Get the edge vectors and lengths.
                 # NOTE: Modified function
                 vectors, _, lengths, edge_index, shifts = (
                     self.get_edge_vectors_and_lengths_mod(
-                        positions=positions,
-                        edge_index=edge_index,
-                        shifts=shifts,
-                        lambda_value=self.lamb,
-                        edge_modify_mask=edge_modify_mask,
-                        cutoff=self.model.r_max,
+                        positions=positions, # [n_atoms, 3]
+                        edge_index=edge_index, #[2, n_edges]
+                        shifts=shifts, # [n_edges, 3]
+                        lambda_value=self.lamb, # lamb \in (0,1), scalar
+                        edge_modify_mask=edge_modify_mask, # [n_edges, ]
+                        cutoff=self.model.r_max, # scalar
                     )
                 )
 
@@ -554,30 +563,6 @@ class MACEPotentialImpl(MLPotentialImpl):
                 assert (
                     energy is not None
                 ), "The model did not return any energy. Please check the input."
-
-                # **Add the Repulsive Energy Term**
-
-                # Parameters for the repulsive energy function (in eV and Angstrom)
-                B = 1.5  # Controls the steepness of the exponential increase (in Å⁻¹)
-                r0 = 3.0  # Cutoff distance (in Å)
-
-                # Extract pairwise distances
-                pair_distances = lengths.squeeze(-1)  # Shape: [n_edges]
-
-                # Identify pairs within the cutoff distance
-                within_cutoff = pair_distances <= r0  # Boolean mask
-
-                if torch.any(within_cutoff):
-                    # Compute the repulsive energy for these pairs
-                    repulsive_energies = relu(
-                        torch.exp(-B * (pair_distances[within_cutoff] - r0)) * 0.01
-                    )
-                    total_repulsive_energy = torch.sum(repulsive_energies)
-                    # Add to the total energy
-                    total_energy = energy + total_repulsive_energy
-                else:
-                    total_energy = energy
-
                 return energy * self.energyScale
 
         isPeriodic = (
