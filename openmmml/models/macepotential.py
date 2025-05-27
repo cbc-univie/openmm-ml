@@ -36,13 +36,13 @@ from typing import Iterable, Optional, Tuple
 from torch.nn.functional import relu
 
 
-def wrap_model():
+def wrap_model(size, default_dtype):
     # CUSTOMIZED FUCTION
     from mace.calculators import mace_off
     from mace.tools.scripts_utils import extract_config_mace_model
     from mace import modules
-    size :str = 'medium'
-    default_dtype: str="float32"
+    # size :str = 'small'
+    # default_dtype: str="float32"
     print(f'Using model size : {size} with precision: {default_dtype}')
     model = mace_off(model=size, device="cpu", default_dtype=default_dtype).models[0] #FIXME: why indexing?
     # extract hyperparameters of model and build the model according to hyperparameter and size
@@ -112,6 +112,9 @@ class MACEPotentialImpl(MLPotentialImpl):
         modelPath: str,
         atom_groups: torch.Tensor,
         lamb: float,
+        shifting_style: str,
+        size: str,
+        default_dtype: str,
     ) -> None:
         """
         Initialize the MACEPotentialImpl.
@@ -128,6 +131,9 @@ class MACEPotentialImpl(MLPotentialImpl):
         self.modelPath = modelPath
         self.atom_groups = atom_groups
         self.lamb = lamb
+        self.shifting_style = shifting_style
+        self.size = size
+        self.default_dtype = default_dtype
 
     def addForces(
         self,
@@ -191,6 +197,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         ], f"Unsupported returnEnergyType: '{returnEnergyType}'. Supported options are 'interaction_energy' or 'energy'."
 
         # Load the model to the CPU (OpenMM-Torch takes care of loading to the right devices)
+        
         if self.name.startswith("mace-off23"):
             # NOTE: DON'T USE THIS
             # THAT"S THE ORIGINAL MACE CALL
@@ -209,7 +216,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         elif self.name == 'mace-alch':
                 # this is what should be called to run alchemical MACE
                 print('Using alchemical MACE ...')
-                model = wrap_model()
+                model = wrap_model(self.size, self.default_dtype)
         else:
             raise ValueError(f"Unsupported MACE model: {self.name}")
 
@@ -283,7 +290,9 @@ class MACEPotentialImpl(MLPotentialImpl):
                 dtype: torch.dtype,
                 returnEnergyType: str,
                 lamb: float,
+                shifting_style: str,
                 atom_groups: torch.Tensor,
+                default_dtype: str,
             ) -> None:
                 """
                 Initialize the MACEForce.
@@ -311,6 +320,8 @@ class MACEPotentialImpl(MLPotentialImpl):
                 self.lengthScale = 10.0
                 self.returnEnergyType = returnEnergyType
                 self.lamb = lamb
+                self.shifting_style = shifting_style
+                self.default_dtype = default_dtype
 
                 if atoms is None:
                     self.indices = None
@@ -389,7 +400,97 @@ class MACEPotentialImpl(MLPotentialImpl):
                         device=positions.device,
                     )
                 return edgeIndex, shifts
+            
 
+            # NOTE put shifting functions here
+            #############################################################################################
+
+
+            def _shift_linear(self, 
+                              distance: torch.Tensor, 
+                              modify_mask: torch.Tensor, 
+                              lambda_value: float, 
+                              cutoff: float, 
+                              eps: float,
+                              ) -> torch.Tensor:
+                delta = lambda_value * cutoff
+                distance = distance.clone()
+                distance[modify_mask] = distance[modify_mask] + delta
+                return distance
+
+            def _shift_linear_to_cutoff(self, 
+                              distance: torch.Tensor, 
+                              modify_mask: torch.Tensor, 
+                              lambda_value: float, 
+                              cutoff: float, 
+                              eps: float,
+                              ) -> torch.Tensor:
+                distance_to_cutoff = torch.clamp(cutoff - distance, min=0) + eps
+                delta = distance_to_cutoff * lambda_value
+                distance = distance.clone()
+                distance[modify_mask] = distance[modify_mask] + delta[modify_mask]
+                return distance
+
+            def _shift_4d(self, 
+                              distance: torch.Tensor, 
+                              modify_mask: torch.Tensor, 
+                              lambda_value: float, 
+                              cutoff: float, 
+                              eps: float,
+                              ) -> torch.Tensor:
+                delta = (lambda_value * cutoff) ** 2
+                distance = distance.clone()
+                distance[modify_mask] = torch.sqrt(distance[modify_mask] ** 2 + delta)
+                return distance
+
+            def _shift_4d_to_cutoff(self, 
+                              distance: torch.Tensor, 
+                              modify_mask: torch.Tensor, 
+                              lambda_value: float, 
+                              cutoff: float, 
+                              eps: float,
+                              ) -> torch.Tensor:
+                d_squared = distance[modify_mask] ** 2
+                cutoff_squared = cutoff ** 2
+                distance_to_cutoff = torch.clamp(cutoff_squared - d_squared, min=0.0) + eps
+                delta = distance_to_cutoff * lambda_value
+                new_distance = torch.sqrt(d_squared + delta)
+                distance = distance.clone()
+                distance[modify_mask] = new_distance
+                return distance
+
+        
+
+            def get_shifted_distances(self, 
+                                      shifting_style: str, 
+                                      distance: torch.Tensor, 
+                                      modify_mask: torch.Tensor,
+                                      lambda_value: float, 
+                                      cutoff: float, 
+                                      eps: float
+                                      ):
+                if shifting_style == "linear":
+                    return self._shift_linear(distance, modify_mask, lambda_value, cutoff, eps)
+                elif shifting_style == "linear_to_cutoff":
+                    return self._shift_linear_to_cutoff(distance, modify_mask, lambda_value, cutoff, eps)
+                elif shifting_style == "4D":
+                    return self._shift_4d(distance, modify_mask, lambda_value, cutoff, eps)
+                elif shifting_style == "4D_to_cutoff":
+                    return self._shift_4d_to_cutoff(distance, modify_mask, lambda_value, cutoff, eps)
+                else:
+                    raise ValueError(f"Unknown shifting style: {shifting_style}")
+
+
+            def get_epsilon(self) -> float:
+                if self.default_dtype =="float32":
+                    epsilon = 1e-6
+                else:
+                    epsilon = 1e-9
+                return epsilon
+
+            #############################################################################################
+            
+            
             def get_edge_modify_mask(
                 self,
                 edge_index: torch.Tensor,  # [2, n_edges]
@@ -428,11 +529,15 @@ class MACEPotentialImpl(MLPotentialImpl):
                 lambda_value: float, 
                 edge_modify_mask: torch.Tensor,  # [n_edges]
                 cutoff: float,
+                shifting_style: str = 'linear_to_cutoff',
                 normalize: bool = False,
-                eps: float = 1e-9,
+                # eps: float = 1e-6, #NOTE remove this
             ) -> Tuple[
                 torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
             ]:
+                
+                eps = self.get_epsilon()
+
                 
                 sender = edge_index[0] # equivalent to atom_i
                 receiver = edge_index[1] # equivalent to atom_j
@@ -457,12 +562,16 @@ class MACEPotentialImpl(MLPotentialImpl):
                         edge_modify_mask != 0
                     )  # [n_edges] - boolean-like tensor
                     # FIXME: make sure that 0 and 1 have the right values?
-                    delta = lambda_value * cutoff  # Increment over the cutoff # FIXME:
-                    
-                    distance = distance.clone()
-                    distance[modify_mask] = distance[modify_mask] + delta
-                    # print(f"Lengths after: {lengths}")
 
+                    # NOTE shift distances here
+                    distance = self.get_shifted_distances(
+                        shifting_style, 
+                        distance, 
+                        modify_mask, 
+                        lambda_value, 
+                        cutoff, 
+                        eps
+                        )
 
                 # # Apply cutoff to mask out long edges
                 valid_mask = distance.squeeze(-1) <= cutoff  # [n_edges]
@@ -533,6 +642,7 @@ class MACEPotentialImpl(MLPotentialImpl):
                         lambda_value=self.lamb, # lamb \in (0,1), scalar
                         edge_modify_mask=edge_modify_mask, # [n_edges, ]
                         cutoff=self.model.r_max, # scalar
+                        shifting_style=self.shifting_style,
                     )
                 )
 
@@ -581,6 +691,8 @@ class MACEPotentialImpl(MLPotentialImpl):
             returnEnergyType,
             lamb=self.lamb,
             atom_groups=self.atom_groups,
+            shifting_style=self.shifting_style,
+            default_dtype=self.default_dtype
         )
 
         # Convert it to TorchScript.
