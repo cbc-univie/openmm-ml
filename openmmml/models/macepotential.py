@@ -36,19 +36,24 @@ from typing import Iterable, Optional, Tuple
 from torch.nn.functional import relu
 
 
-def wrap_model(size, default_dtype):
+def wrap_model(size, default_dtype, optimize:bool = False):
     # CUSTOMIZED FUCTION
     from mace.calculators import mace_off
     from mace.tools.scripts_utils import extract_config_mace_model
-    from mace import modules
     # size :str = 'small'
     # default_dtype: str="float32"
     print(f'Using model size : {size} with precision: {default_dtype}')
     model = mace_off(model=size, device="cpu", default_dtype=default_dtype).models[0] #FIXME: why indexing?
     # extract hyperparameters of model and build the model according to hyperparameter and size
-    model_copy = modules.models.AlchemicalScaleShiftMACE(
-        **extract_config_mace_model(model)
-    )
+
+    hyperparamter = extract_config_mace_model(model)
+    
+    if optimize:
+        from cuda_mace.modules.models import OptimizedInvariantMACE 
+        model_copy = OptimizedInvariantMACE(**hyperparamter)
+    else:
+        from mace.modules.models import AlchemicalScaleShiftMACE 
+        model_copy = AlchemicalScaleShiftMACE(**hyperparameter)
     # load trained parameters & biases from openff MACE model
     model_copy.load_state_dict(model.state_dict())
     return model_copy
