@@ -46,11 +46,11 @@ def wrap_model(size, default_dtype, optimize:bool = False):
     model = mace_off(model=size, device="cpu", default_dtype=default_dtype).models[0] #FIXME: why indexing?
     # extract hyperparameters of model and build the model according to hyperparameter and size
 
-    hyperparamter = extract_config_mace_model(model)
+    hyperparameter = extract_config_mace_model(model)
     
     if optimize:
         from cuda_mace.modules.models import OptimizedInvariantMACE 
-        model_copy = OptimizedInvariantMACE(**hyperparamter)
+        model_copy = OptimizedInvariantMACE(**hyperparameter)
     else:
         from mace.modules.models import AlchemicalScaleShiftMACE 
         model_copy = AlchemicalScaleShiftMACE(**hyperparameter)
